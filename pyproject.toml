@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bm25search"
+version = "1.0.0"
+description = "Clean BM25 search engine with stemming and lemmatization support"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "BM25Search Team", email = "contact@bm25search.com"},
+]
+maintainers = [
+    {name = "BM25Search Team", email = "contact@bm25search.com"},
+]
+keywords = ["bm25", "search", "engine", "information", "retrieval", "text", "full-text"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
+dependencies = [
+    "langdetect>=1.0.9",
+]
+
+[project.optional-dependencies]
+full = [
+    "nltk>=3.8",
+    "pymorphy2>=0.9.1",
+    "pymorphy2-dicts-ru>=2.4.417127.4579844",
+]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/bm25search"
+Documentation = "https://github.com/yourusername/bm25search#readme"
+Repository = "https://github.com/yourusername/bm25search.git"
+"Bug Tracker" = "https://github.com/yourusername/bm25search/issues"
+
+[tool.setuptools]
+py-modules = ["bm25search"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+bm25search = ["*.py"]
+
+[tool.black]
+line-length = 100
+target-version = ['py37']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.7"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers"
+testpaths = [
+    "tests",
+]
