@@ -8,6 +8,8 @@ def test_morphology():
     
     engine = SmartSearchEngine(db_path=":memory:")
     
+    print("lemma_error:", engine.get_stats().get("lemma_error"))
+    
     # Проверим, что языковые процессоры загружены
     print(" Проверка языковых процессоров:")
     print(f"  Русский процессор: {engine.processors.get('ru', 'НЕ НАЙДЕН')}")

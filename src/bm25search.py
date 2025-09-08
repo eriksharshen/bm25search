@@ -24,13 +24,22 @@ import math
 import re
 import sqlite3
 import json
-import os
-from urllib.request import urlretrieve
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Optional
 import warnings
+import inspect
 
 warnings.filterwarnings('ignore')
+
+# Compatibility shim: some third-party libs still expect inspect.getargspec (returns 4-tuple)
+if not hasattr(inspect, 'getargspec'):
+    def _compat_getargspec(func):  # type: ignore
+        fas = inspect.getfullargspec(func)  # returns 7-tuple
+        return (fas.args, fas.varargs, fas.varkw, fas.defaults)
+    try:
+        inspect.getargspec = _compat_getargspec  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 try:
     import nltk
@@ -53,10 +62,10 @@ except ImportError:
     LANGDETECT_AVAILABLE = False
 
 try:
-    import fasttext
-    FASTTEXT_AVAILABLE = True
+    import langid
+    LANGID_AVAILABLE = True
 except ImportError:
-    FASTTEXT_AVAILABLE = False
+    LANGID_AVAILABLE = False
 
 
 class SmartSearchEngine:
@@ -81,7 +90,10 @@ class SmartSearchEngine:
     def __init__(self, 
                  db_path: str = "search_index.db",
                  k1: float = 1.5, 
-                 b: float = 0.75):
+                 b: float = 0.75,
+                 original_weight: float = 1.0,
+                 normalized_weight: float = 0.6,
+                 exact_surface_bonus: float = 0.5):
         """
         Initialize the search engine.
         
@@ -94,8 +106,11 @@ class SmartSearchEngine:
         self.k1 = k1
         self.b = b
         self.conn = None
+        self.original_weight = original_weight
+        self.normalized_weight = normalized_weight
         self._setup_database()
         self._setup_language_tools()
+        self.exact_surface_bonus = exact_surface_bonus
         
     def _setup_database(self):
         """Initialize SQLite database with required tables."""
@@ -160,10 +175,13 @@ class SmartSearchEngine:
             pass
 
         morph_analyzer = None
+        self._lemma_init_error = None
         try:
             import pymorphy2 as _pm  # type: ignore
             morph_analyzer = _pm.MorphAnalyzer()
-        except Exception:
+        except Exception as e:
+            # Keep the error message for diagnostics
+            self._lemma_init_error = str(e)
             morph_analyzer = None
 
         # Base stopwords fallbacks
@@ -218,47 +236,19 @@ class SmartSearchEngine:
         }
     
     def _load_fasttext_model(self):
-        """Load fastText language ID model if available; download if missing.
-        Returns the loaded model or None on failure.
-        """
-        if not FASTTEXT_AVAILABLE:
-            return None
-        # Reuse already loaded model
-        if getattr(self, '_ft_model', None) is not None:
-            return self._ft_model
-        # Determine cache path
-        cache_dir = os.path.join(os.path.expanduser('~'), '.bm25search')
-        os.makedirs(cache_dir, exist_ok=True)
-        model_path = os.path.join(cache_dir, 'lid.176.bin')
-        # Download if missing (about 126 MB)
-        if not os.path.exists(model_path):
-            try:
-                url = 'https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin'
-                urlretrieve(url, model_path)
-            except Exception:
-                return None
-        # Load model
-        try:
-            self._ft_model = fasttext.load_model(model_path)
-            return self._ft_model
-        except Exception:
-            self._ft_model = None
-            return None
+        """Deprecated: fastText disabled. Always returns None."""
+        return None
     
     def _detect_language(self, text: str) -> str:
-        """Detect the language of the input text (prefer fastText -> langdetect -> heuristic)."""
+        """Detect language: langid (primary) -> langdetect -> heuristic."""
         txt = (text or '').strip()
         if not txt:
             return 'en'
-        # 1) fastText
-        ft_model = self._load_fasttext_model()
-        if ft_model is not None:
+        # 1) langid
+        if 'LANGID_AVAILABLE' in globals() and LANGID_AVAILABLE:
             try:
-                # FastText expects a single line; limit very long inputs
-                labels, probs = ft_model.predict(txt.replace('\n', ' ')[:2000])
-                if labels:
-                    code = labels[0].replace('__label__', '')
-                    return 'ru' if code == 'ru' else 'en'
+                code, score = langid.classify(txt)
+                return 'ru' if code == 'ru' else 'en'
             except Exception:
                 pass
         # 2) langdetect fallback
@@ -299,6 +289,15 @@ class SmartSearchEngine:
         
         # Get processor for language
         processor = self.processors.get(language, {})
+        # Lazy retry to initialize RU lemmatizer if missing
+        if language == 'ru' and not processor.get('lemmatizer'):
+            try:
+                import pymorphy2 as _pm  # type: ignore
+                processor['lemmatizer'] = _pm.MorphAnalyzer()
+                # persist in processors map
+                self.processors['ru'] = processor
+            except Exception as e:
+                self._lemma_init_error = str(e)
         stopwords_set = processor.get('stopwords', set())
         
         # Filter stopwords and apply stemming/lemmatization
@@ -313,12 +312,20 @@ class SmartSearchEngine:
 
                 # Language-specific normalization
                 if language == 'ru':
-                    # Russian: prefer lemmatization only
+                    # Russian: prefer lemmatization; fallback to stemming if lemmatizer unavailable
                     if processor.get('lemmatizer'):
                         try:
                             lemma = processor['lemmatizer'].parse(word)[0].normal_form
                             if len(lemma) > 2 and lemma != word and lemma not in filtered_words:
                                 filtered_words.append(lemma)
+                                filtered_positions.append(pos)
+                        except:
+                            pass
+                    elif processor.get('stemmer'):
+                        try:
+                            stem = processor['stemmer'].stem(word)
+                            if len(stem) > 2 and stem != word and stem not in filtered_words:
+                                filtered_words.append(stem)
                                 filtered_positions.append(pos)
                         except:
                             pass
@@ -352,6 +359,21 @@ class SmartSearchEngine:
                             pass
         
         return filtered_words, filtered_positions
+
+    def _extract_original_terms(self, text: str, language: str = None) -> Set[str]:
+        """Tokenize and filter stopwords, but do NOT add stems/lemmas. Used for weighting."""
+        if not text:
+            return set()
+        if language is None:
+            language = self._detect_language(text)
+        processor = self.processors.get(language, {})
+        stopwords_set = processor.get('stopwords', set())
+        terms = set()
+        for match in re.finditer(r'\b\w+\b', text):
+            word = match.group()
+            if len(word) > 2 and word not in stopwords_set:
+                terms.add(word)
+        return terms
     
     def index_documents(self, documents: List[str]) -> None:
         """
@@ -425,6 +447,7 @@ class SmartSearchEngine:
         
         language = self._detect_language(query)
         query_terms, query_positions = self._preprocess_text(query, language)
+        original_query_terms = self._extract_original_terms(query, language)
         
         if not query_terms:
             return []
@@ -478,14 +501,22 @@ class SmartSearchEngine:
                         # BM25 formula
                         numerator = tf * (self.k1 + 1)
                         denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
-                        bm25_score += idf * (numerator / denominator)
+                        weight = self.original_weight if term in original_query_terms else self.normalized_weight
+                        bm25_score += weight * idf * (numerator / denominator)
             
-            if bm25_score > 0:
-                cursor = self.conn.execute(
-                    'SELECT content FROM documents WHERE id = ?', (doc_id,)
-                )
-                content = cursor.fetchone()[0]
-                results.append((doc_id, bm25_score, content))
+            cursor = self.conn.execute(
+                'SELECT content FROM documents WHERE id = ?', (doc_id,)
+            )
+            content_row = cursor.fetchone()
+            if content_row is not None:
+                content = content_row[0]
+                # Exact surface-form bonus: add per original token present as a whole word
+                bonus = 0.0
+                content_lower = content.lower()
+                for tok in original_query_terms:
+                    if re.search(r'\b' + re.escape(tok.lower()) + r'\b', content_lower):
+                        bonus += self.exact_surface_bonus
+                results.append((doc_id, bm25_score + bonus, content))
         
         # Sort and return results
         results.sort(key=lambda x: x[1], reverse=True)
@@ -504,6 +535,7 @@ class SmartSearchEngine:
         """
         language = self._detect_language(query)
         query_terms, query_positions = self._preprocess_text(query, language)
+        original_query_terms = self._extract_original_terms(query, language)
         
         # Get document
         cursor = self.conn.execute(
@@ -547,14 +579,26 @@ class SmartSearchEngine:
                 
                 numerator = tf * (self.k1 + 1)
                 denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
-                term_score = idf * (numerator / denominator)
+                weight = self.original_weight if term in original_query_terms else self.normalized_weight
+                term_score = weight * idf * (numerator / denominator)
                 bm25_score += term_score
                 
                 term_details[term] = {
                     'tf': tf,
                     'idf': idf,
+                    'weight': weight,
+                    'is_original': term in original_query_terms,
                     'score': term_score
                 }
+        # Exact surface bonus details
+        exact_matches = []
+        bonus = 0.0
+        content_lower = doc_content.lower()
+        for tok in original_query_terms:
+            if re.search(r'\b' + re.escape(tok.lower()) + r'\b', content_lower):
+                exact_matches.append(tok)
+                bonus += self.exact_surface_bonus
+        bm25_score += bonus
         
         return {
             'query': query,
@@ -564,7 +608,9 @@ class SmartSearchEngine:
             'processed_query_terms': query_terms,
             'bm25_score': bm25_score,
             'final_score': bm25_score,
-            'term_details': term_details
+            'term_details': term_details,
+            'exact_surface_matches': exact_matches,
+            'exact_surface_bonus': bonus
         }
     
     def get_stats(self) -> Dict:
@@ -589,7 +635,8 @@ class SmartSearchEngine:
                 'lemmatization': PYMORPHY2_AVAILABLE
             },
             'language_detection': LANGDETECT_AVAILABLE,
-            'database_path': self.db_path
+            'database_path': self.db_path,
+            'lemma_error': getattr(self, '_lemma_init_error', None)
         }
     
     def close(self):

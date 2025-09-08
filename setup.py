@@ -51,7 +51,7 @@ setup(
         "nltk>=3.6",
         "pymorphy2>=0.9.1",
         "langdetect>=1.0.9",
-        "fasttext>=0.9.2",
+        "langid>=1.1.6",
     ],
     extras_require={
         "dev": [
