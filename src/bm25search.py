@@ -93,7 +93,11 @@ class SmartSearchEngine:
                  b: float = 0.75,
                  original_weight: float = 1.0,
                  normalized_weight: float = 0.6,
-                 exact_surface_bonus: float = 0.5):
+                 exact_surface_bonus: float = 0.5,
+                 use_bigrams: bool = True,
+                 phrase_weight: float = 1.3,
+                 proximity_bonus: float = 0.3,
+                 proximity_window: int = 3):
         """
         Initialize the search engine.
         
@@ -111,6 +115,10 @@ class SmartSearchEngine:
         self._setup_database()
         self._setup_language_tools()
         self.exact_surface_bonus = exact_surface_bonus
+        self.use_bigrams = use_bigrams
+        self.phrase_weight = phrase_weight
+        self.proximity_bonus = proximity_bonus
+        self.proximity_window = proximity_window
         
     def _setup_database(self):
         """Initialize SQLite database with required tables."""
@@ -374,6 +382,23 @@ class SmartSearchEngine:
             if len(word) > 2 and word not in stopwords_set:
                 terms.add(word)
         return terms
+
+    def _tokenize_original_sequence(self, text: str, language: str = None) -> Tuple[List[str], List[int]]:
+        """Return ordered sequence of original tokens (no stemming/lemmatization), positions are character offsets."""
+        if not text:
+            return [], []
+        if language is None:
+            language = self._detect_language(text)
+        processor = self.processors.get(language, {})
+        stopwords_set = processor.get('stopwords', set())
+        words: List[str] = []
+        positions: List[int] = []
+        for match in re.finditer(r'\b\w+\b', text):
+            word = match.group()
+            if len(word) > 2 and word not in stopwords_set:
+                words.append(word)
+                positions.append(match.start())
+        return words, positions
     
     def index_documents(self, documents: List[str]) -> None:
         """
@@ -399,6 +424,7 @@ class SmartSearchEngine:
             
             language = self._detect_language(doc_content)
             terms, positions = self._preprocess_text(doc_content, language)
+            orig_words_seq, orig_pos_seq = self._tokenize_original_sequence(doc_content, language)
             
             # Save document
             self.conn.execute('''
@@ -419,6 +445,21 @@ class SmartSearchEngine:
                     INSERT INTO term_index (term, doc_id, tf, positions)
                     VALUES (?, ?, ?, ?)
                 ''', (term, doc_id, tf, json.dumps(pos_list)))
+
+            # Index bigrams from original token sequence
+            if self.use_bigrams and len(orig_words_seq) >= 2:
+                bigram_positions = defaultdict(list)
+                for i in range(len(orig_words_seq) - 1):
+                    bg = f"{orig_words_seq[i]} {orig_words_seq[i+1]}"
+                    # use start position of the first token
+                    bigram_positions[bg].append(orig_pos_seq[i])
+                for bg, pos_list in bigram_positions.items():
+                    tf = len(pos_list)
+                    term_frequencies[bg] += 1
+                    self.conn.execute('''
+                        INSERT INTO term_index (term, doc_id, tf, positions)
+                        VALUES (?, ?, ?, ?)
+                    ''', (bg, doc_id, tf, json.dumps(pos_list)))
         
         # Calculate and save IDF scores
         total_docs = len(documents)
@@ -448,6 +489,11 @@ class SmartSearchEngine:
         language = self._detect_language(query)
         query_terms, query_positions = self._preprocess_text(query, language)
         original_query_terms = self._extract_original_terms(query, language)
+        query_bigrams: List[str] = []
+        if self.use_bigrams:
+            orig_seq, _ = self._tokenize_original_sequence(query, language)
+            for i in range(len(orig_seq) - 1):
+                query_bigrams.append(f"{orig_seq[i]} {orig_seq[i+1]}")
         
         if not query_terms:
             return []
@@ -459,6 +505,18 @@ class SmartSearchEngine:
                 'SELECT doc_id FROM term_index WHERE term = ?', (term,)
             )
             candidate_docs.update(row[0] for row in cursor.fetchall())
+
+        # Include candidates by bigrams
+        query_bigrams: List[str] = []
+        if self.use_bigrams:
+            orig_seq, _ = self._tokenize_original_sequence(query, language)
+            for i in range(len(orig_seq) - 1):
+                bg = f"{orig_seq[i]} {orig_seq[i+1]}"
+                query_bigrams.append(bg)
+                cursor = self.conn.execute(
+                    'SELECT doc_id FROM term_index WHERE term = ?', (bg,)
+                )
+                candidate_docs.update(row[0] for row in cursor.fetchall())
         
         if not candidate_docs:
             return []
@@ -503,7 +561,27 @@ class SmartSearchEngine:
                         denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
                         weight = self.original_weight if term in original_query_terms else self.normalized_weight
                         bm25_score += weight * idf * (numerator / denominator)
-            
+
+            # Add phrase (bigram) scores
+            if self.use_bigrams and query_bigrams:
+                for bg in query_bigrams:
+                    cursor = self.conn.execute(
+                        'SELECT tf FROM term_index WHERE term = ? AND doc_id = ?',
+                        (bg, doc_id)
+                    )
+                    tf_result = cursor.fetchone()
+                    if tf_result:
+                        tf = tf_result[0]
+                        cursor = self.conn.execute(
+                            'SELECT idf FROM idf_scores WHERE term = ?', (bg,)
+                        )
+                        idf_result = cursor.fetchone()
+                        if idf_result:
+                            idf = idf_result[0]
+                            numerator = tf * (self.k1 + 1)
+                            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
+                            bm25_score += self.phrase_weight * idf * (numerator / denominator)
+
             cursor = self.conn.execute(
                 'SELECT content FROM documents WHERE id = ?', (doc_id,)
             )
@@ -516,6 +594,28 @@ class SmartSearchEngine:
                 for tok in original_query_terms:
                     if re.search(r'\b' + re.escape(tok.lower()) + r'\b', content_lower):
                         bonus += self.exact_surface_bonus
+                # Proximity bonus: reward close occurrences of different original tokens
+                if self.proximity_bonus and len(original_query_terms) >= 2:
+                    orig_list = list(original_query_terms)
+                    window_chars = max(1, self.proximity_window * 10)
+                    for i in range(len(orig_list)):
+                        for j in range(i+1, len(orig_list)):
+                            t1, t2 = orig_list[i], orig_list[j]
+                            # get positions lists
+                            p1 = self.conn.execute('SELECT positions FROM term_index WHERE term = ? AND doc_id = ?', (t1, doc_id)).fetchone()
+                            p2 = self.conn.execute('SELECT positions FROM term_index WHERE term = ? AND doc_id = ?', (t2, doc_id)).fetchone()
+                            if p1 and p2:
+                                pos1 = json.loads(p1[0])
+                                pos2 = json.loads(p2[0])
+                                # minimal absolute char distance
+                                mind = None
+                                for a in pos1:
+                                    for b in pos2:
+                                        d = abs(a - b)
+                                        if mind is None or d < mind:
+                                            mind = d
+                                if mind is not None and mind <= window_chars:
+                                    bonus += self.proximity_bonus * (window_chars - mind) / window_chars
                 results.append((doc_id, bm25_score + bonus, content))
         
         # Sort and return results
@@ -536,6 +636,11 @@ class SmartSearchEngine:
         language = self._detect_language(query)
         query_terms, query_positions = self._preprocess_text(query, language)
         original_query_terms = self._extract_original_terms(query, language)
+        query_bigrams: List[str] = []
+        if self.use_bigrams:
+            orig_seq, _ = self._tokenize_original_sequence(query, language)
+            for i in range(len(orig_seq) - 1):
+                query_bigrams.append(f"{orig_seq[i]} {orig_seq[i+1]}")
         
         # Get document
         cursor = self.conn.execute(
@@ -590,6 +695,32 @@ class SmartSearchEngine:
                     'is_original': term in original_query_terms,
                     'score': term_score
                 }
+        # Phrase (bigram) components
+        if self.use_bigrams and query_bigrams:
+            for bg in query_bigrams:
+                cursor = self.conn.execute(
+                    'SELECT tf FROM term_index WHERE term = ? AND doc_id = ?', 
+                    (bg, doc_id)
+                )
+                tf_result = cursor.fetchone()
+                if tf_result:
+                    tf = tf_result[0]
+                    cursor = self.conn.execute('SELECT idf FROM idf_scores WHERE term = ?', (bg,))
+                    idf_row = cursor.fetchone()
+                    if idf_row:
+                        idf = idf_row[0]
+                        numerator = tf * (self.k1 + 1)
+                        denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
+                        term_score = self.phrase_weight * idf * (numerator / denominator)
+                        bm25_score += term_score
+                        term_details[bg] = {
+                            'tf': tf,
+                            'idf': idf,
+                            'weight': self.phrase_weight,
+                            'is_original': True,
+                            'score': term_score,
+                            'type': 'bigram'
+                        }
         # Exact surface bonus details
         exact_matches = []
         bonus = 0.0
@@ -598,6 +729,29 @@ class SmartSearchEngine:
             if re.search(r'\b' + re.escape(tok.lower()) + r'\b', content_lower):
                 exact_matches.append(tok)
                 bonus += self.exact_surface_bonus
+        # Proximity bonus details
+        proximity_pairs = []
+        if self.proximity_bonus and len(original_query_terms) >= 2:
+            orig_list = list(original_query_terms)
+            window_chars = max(1, self.proximity_window * 10)
+            for i in range(len(orig_list)):
+                for j in range(i+1, len(orig_list)):
+                    t1, t2 = orig_list[i], orig_list[j]
+                    p1 = self.conn.execute('SELECT positions FROM term_index WHERE term = ? AND doc_id = ?', (t1, doc_id)).fetchone()
+                    p2 = self.conn.execute('SELECT positions FROM term_index WHERE term = ? AND doc_id = ?', (t2, doc_id)).fetchone()
+                    if p1 and p2:
+                        pos1 = json.loads(p1[0])
+                        pos2 = json.loads(p2[0])
+                        mind = None
+                        for a in pos1:
+                            for b in pos2:
+                                d = abs(a - b)
+                                if mind is None or d < mind:
+                                    mind = d
+                        if mind is not None and mind <= window_chars:
+                            inc = self.proximity_bonus * (window_chars - mind) / window_chars
+                            bonus += inc
+                            proximity_pairs.append({'pair': (t1, t2), 'min_distance_chars': mind, 'bonus': inc})
         bm25_score += bonus
         
         return {
@@ -610,7 +764,9 @@ class SmartSearchEngine:
             'final_score': bm25_score,
             'term_details': term_details,
             'exact_surface_matches': exact_matches,
-            'exact_surface_bonus': bonus
+            'exact_surface_bonus': bonus,
+            'proximity_pairs': proximity_pairs,
+            'use_bigrams': self.use_bigrams
         }
     
     def get_stats(self) -> Dict:
