@@ -95,7 +95,10 @@ class SmartSearchEngine:
                  normalized_weight: float = 0.6,
                  exact_surface_bonus: float = 0.5,
                  use_bigrams: bool = True,
+                 use_trigrams: bool = False,
                  phrase_weight: float = 1.3,
+                 trigram_weight: float = 1.6,
+                 min_ngram_df: int = 1,
                  proximity_bonus: float = 0.3,
                  proximity_window: int = 3):
         """
@@ -116,7 +119,10 @@ class SmartSearchEngine:
         self._setup_language_tools()
         self.exact_surface_bonus = exact_surface_bonus
         self.use_bigrams = use_bigrams
+        self.use_trigrams = use_trigrams
         self.phrase_weight = phrase_weight
+        self.trigram_weight = trigram_weight
+        self.min_ngram_df = min_ngram_df
         self.proximity_bonus = proximity_bonus
         self.proximity_window = proximity_window
         
@@ -460,10 +466,27 @@ class SmartSearchEngine:
                         INSERT INTO term_index (term, doc_id, tf, positions)
                         VALUES (?, ?, ?, ?)
                     ''', (bg, doc_id, tf, json.dumps(pos_list)))
+
+            # Index trigrams from original token sequence
+            if self.use_trigrams and len(orig_words_seq) >= 3:
+                trigram_positions = defaultdict(list)
+                for i in range(len(orig_words_seq) - 2):
+                    tg = f"{orig_words_seq[i]} {orig_words_seq[i+1]} {orig_words_seq[i+2]}"
+                    trigram_positions[tg].append(orig_pos_seq[i])
+                for tg, pos_list in trigram_positions.items():
+                    tf = len(pos_list)
+                    term_frequencies[tg] += 1
+                    self.conn.execute('''
+                        INSERT INTO term_index (term, doc_id, tf, positions)
+                        VALUES (?, ?, ?, ?)
+                    ''', (tg, doc_id, tf, json.dumps(pos_list)))
         
         # Calculate and save IDF scores
         total_docs = len(documents)
         for term, df in term_frequencies.items():
+            # Apply df threshold for n-grams (>1 token)
+            if (' ' in term) and df < self.min_ngram_df:
+                continue
             idf = math.log((total_docs - df + 0.5) / (df + 0.5))
             self.conn.execute('''
                 INSERT INTO idf_scores (term, idf, df)
@@ -489,11 +512,6 @@ class SmartSearchEngine:
         language = self._detect_language(query)
         query_terms, query_positions = self._preprocess_text(query, language)
         original_query_terms = self._extract_original_terms(query, language)
-        query_bigrams: List[str] = []
-        if self.use_bigrams:
-            orig_seq, _ = self._tokenize_original_sequence(query, language)
-            for i in range(len(orig_seq) - 1):
-                query_bigrams.append(f"{orig_seq[i]} {orig_seq[i+1]}")
         
         if not query_terms:
             return []
@@ -515,6 +533,17 @@ class SmartSearchEngine:
                 query_bigrams.append(bg)
                 cursor = self.conn.execute(
                     'SELECT doc_id FROM term_index WHERE term = ?', (bg,)
+                )
+                candidate_docs.update(row[0] for row in cursor.fetchall())
+        # Include candidates by trigrams
+        query_trigrams: List[str] = []
+        if self.use_trigrams:
+            orig_seq, _ = self._tokenize_original_sequence(query, language)
+            for i in range(len(orig_seq) - 2):
+                tg = f"{orig_seq[i]} {orig_seq[i+1]} {orig_seq[i+2]}"
+                query_trigrams.append(tg)
+                cursor = self.conn.execute(
+                    'SELECT doc_id FROM term_index WHERE term = ?', (tg,)
                 )
                 candidate_docs.update(row[0] for row in cursor.fetchall())
         
@@ -582,6 +611,26 @@ class SmartSearchEngine:
                             denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
                             bm25_score += self.phrase_weight * idf * (numerator / denominator)
 
+            # Add phrase (trigram) scores
+            if self.use_trigrams and query_trigrams:
+                for tg in query_trigrams:
+                    cursor = self.conn.execute(
+                        'SELECT tf FROM term_index WHERE term = ? AND doc_id = ?',
+                        (tg, doc_id)
+                    )
+                    tf_result = cursor.fetchone()
+                    if tf_result:
+                        tf = tf_result[0]
+                        cursor = self.conn.execute(
+                            'SELECT idf FROM idf_scores WHERE term = ?', (tg,)
+                        )
+                        idf_result = cursor.fetchone()
+                        if idf_result:
+                            idf = idf_result[0]
+                            numerator = tf * (self.k1 + 1)
+                            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
+                            bm25_score += self.trigram_weight * idf * (numerator / denominator)
+
             cursor = self.conn.execute(
                 'SELECT content FROM documents WHERE id = ?', (doc_id,)
             )
@@ -641,6 +690,12 @@ class SmartSearchEngine:
             orig_seq, _ = self._tokenize_original_sequence(query, language)
             for i in range(len(orig_seq) - 1):
                 query_bigrams.append(f"{orig_seq[i]} {orig_seq[i+1]}")
+        # Build trigrams for explain
+        query_trigrams: List[str] = []
+        if self.use_trigrams:
+            orig_seq, _ = self._tokenize_original_sequence(query, language)
+            for i in range(len(orig_seq) - 2):
+                query_trigrams.append(f"{orig_seq[i]} {orig_seq[i+1]} {orig_seq[i+2]}")
         
         # Get document
         cursor = self.conn.execute(
@@ -720,6 +775,32 @@ class SmartSearchEngine:
                             'is_original': True,
                             'score': term_score,
                             'type': 'bigram'
+                        }
+        # Phrase (trigram) components
+        if self.use_trigrams and query_trigrams:
+            for tg in query_trigrams:
+                cursor = self.conn.execute(
+                    'SELECT tf FROM term_index WHERE term = ? AND doc_id = ?', 
+                    (tg, doc_id)
+                )
+                tf_result = cursor.fetchone()
+                if tf_result:
+                    tf = tf_result[0]
+                    cursor = self.conn.execute('SELECT idf FROM idf_scores WHERE term = ?', (tg,))
+                    idf_row = cursor.fetchone()
+                    if idf_row:
+                        idf = idf_row[0]
+                        numerator = tf * (self.k1 + 1)
+                        denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / avg_doc_length))
+                        term_score = self.trigram_weight * idf * (numerator / denominator)
+                        bm25_score += term_score
+                        term_details[tg] = {
+                            'tf': tf,
+                            'idf': idf,
+                            'weight': self.trigram_weight,
+                            'is_original': True,
+                            'score': term_score,
+                            'type': 'trigram'
                         }
         # Exact surface bonus details
         exact_matches = []
