@@ -24,6 +24,8 @@ import math
 import re
 import sqlite3
 import json
+import os
+from urllib.request import urlretrieve
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Optional
 import warnings
@@ -49,6 +51,12 @@ try:
     LANGDETECT_AVAILABLE = True
 except ImportError:
     LANGDETECT_AVAILABLE = False
+
+try:
+    import fasttext
+    FASTTEXT_AVAILABLE = True
+except ImportError:
+    FASTTEXT_AVAILABLE = False
 
 
 class SmartSearchEngine:
@@ -127,46 +135,143 @@ class SmartSearchEngine:
     def _setup_language_tools(self):
         """Initialize text processing tools for different languages."""
         self.processors = {}
-        
-        # Russian language support
-        if NLTK_AVAILABLE and PYMORPHY2_AVAILABLE:
+
+        # Local capability detection to avoid stale globals
+        nltk_available = False
+        nl_stemmer_cls = None
+        nl_stopwords = None
+        try:
+            import nltk  # type: ignore
+            from nltk.stem import SnowballStemmer as _SB  # type: ignore
+            from nltk.corpus import stopwords as _SW  # type: ignore
+            nltk_available = True
+            nl_stemmer_cls = _SB
+            nl_stopwords = _SW
+            # Ensure required resources are present
             try:
-                self.processors['ru'] = {
-                    'stemmer': SnowballStemmer('russian'),
-                    'lemmatizer': pymorphy2.MorphAnalyzer(),
-                    'stopwords': set(stopwords.words('russian')) if hasattr(stopwords, 'words') else {
-                        'и', 'в', 'на', 'с', 'по', 'для', 'не', 'от', 'до', 'из', 'к', 'о', 'что', 'как', 'это'
-                    }
-                }
-            except:
-                pass
-        
-        # English language support
-        if NLTK_AVAILABLE:
+                nltk.data.find('corpora/stopwords')
+            except LookupError:
+                nltk.download('stopwords', quiet=True)
             try:
-                self.processors['en'] = {
-                    'stemmer': SnowballStemmer('english'),
-                    'lemmatizer': None,
-                    'stopwords': set(stopwords.words('english')) if hasattr(stopwords, 'words') else {
-                        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'
-                    }
-                }
-            except:
+                nltk.data.find('tokenizers/punkt')
+            except LookupError:
+                nltk.download('punkt', quiet=True)
+        except Exception:
+            pass
+
+        morph_analyzer = None
+        try:
+            import pymorphy2 as _pm  # type: ignore
+            morph_analyzer = _pm.MorphAnalyzer()
+        except Exception:
+            morph_analyzer = None
+
+        # Base stopwords fallbacks
+        russian_stopwords = {
+            'и', 'в', 'на', 'с', 'по', 'для', 'не', 'от', 'до', 'из', 'к', 'о', 'что', 'как', 'это',
+            'а', 'но', 'или', 'да', 'нет', 'то', 'так', 'уже', 'еще', 'все', 'был', 'была', 'было',
+            'были', 'есть', 'будет', 'будут', 'может', 'можно', 'нужно', 'надо', 'очень', 'более',
+            'самый', 'такой', 'этот', 'тот', 'который', 'где', 'когда', 'почему', 'зачем', 'как'
+        }
+        english_stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+            'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does',
+            'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this', 'that',
+            'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us'
+        }
+
+        # Extend stopwords from NLTK if available
+        if nltk_available and nl_stopwords is not None:
+            try:
+                russian_stopwords.update(set(nl_stopwords.words('russian')))
+            except Exception:
                 pass
+            try:
+                english_stopwords.update(set(nl_stopwords.words('english')))
+            except Exception:
+                pass
+
+        # Compose RU processor
+        ru_stemmer = None
+        if nltk_available and nl_stemmer_cls is not None:
+            try:
+                ru_stemmer = nl_stemmer_cls('russian')
+            except Exception:
+                ru_stemmer = None
+        self.processors['ru'] = {
+            'stemmer': ru_stemmer,
+            'lemmatizer': morph_analyzer,
+            'stopwords': russian_stopwords,
+        }
+
+        # Compose EN processor
+        en_stemmer = None
+        if nltk_available and nl_stemmer_cls is not None:
+            try:
+                en_stemmer = nl_stemmer_cls('english')
+            except Exception:
+                en_stemmer = None
+        self.processors['en'] = {
+            'stemmer': en_stemmer,
+            'lemmatizer': None,
+            'stopwords': english_stopwords,
+        }
+    
+    def _load_fasttext_model(self):
+        """Load fastText language ID model if available; download if missing.
+        Returns the loaded model or None on failure.
+        """
+        if not FASTTEXT_AVAILABLE:
+            return None
+        # Reuse already loaded model
+        if getattr(self, '_ft_model', None) is not None:
+            return self._ft_model
+        # Determine cache path
+        cache_dir = os.path.join(os.path.expanduser('~'), '.bm25search')
+        os.makedirs(cache_dir, exist_ok=True)
+        model_path = os.path.join(cache_dir, 'lid.176.bin')
+        # Download if missing (about 126 MB)
+        if not os.path.exists(model_path):
+            try:
+                url = 'https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin'
+                urlretrieve(url, model_path)
+            except Exception:
+                return None
+        # Load model
+        try:
+            self._ft_model = fasttext.load_model(model_path)
+            return self._ft_model
+        except Exception:
+            self._ft_model = None
+            return None
     
     def _detect_language(self, text: str) -> str:
-        """Detect the language of the input text."""
-        if not LANGDETECT_AVAILABLE:
-            # Simple heuristic
-            if any(char in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for char in text.lower()):
-                return 'ru'
+        """Detect the language of the input text (prefer fastText -> langdetect -> heuristic)."""
+        txt = (text or '').strip()
+        if not txt:
             return 'en'
-        
-        try:
-            lang = detect(text)
-            return 'ru' if lang == 'ru' else 'en'
-        except:
-            return 'en'
+        # 1) fastText
+        ft_model = self._load_fasttext_model()
+        if ft_model is not None:
+            try:
+                # FastText expects a single line; limit very long inputs
+                labels, probs = ft_model.predict(txt.replace('\n', ' ')[:2000])
+                if labels:
+                    code = labels[0].replace('__label__', '')
+                    return 'ru' if code == 'ru' else 'en'
+            except Exception:
+                pass
+        # 2) langdetect fallback
+        if LANGDETECT_AVAILABLE:
+            try:
+                lang = detect(txt)
+                return 'ru' if lang == 'ru' else 'en'
+            except Exception:
+                pass
+        # 3) simple heuristic
+        if any(ch in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for ch in txt.lower()):
+            return 'ru'
+        return 'en'
     
     def _preprocess_text(self, text: str, language: str = None) -> Tuple[List[str], List[int]]:
         """
@@ -202,29 +307,49 @@ class SmartSearchEngine:
         
         for word, pos in zip(words, positions):
             if word not in stopwords_set:
-                # Add original word
+                # Always add original token
                 filtered_words.append(word)
                 filtered_positions.append(pos)
-                
-                # Add stemmed version
-                if processor.get('stemmer'):
-                    try:
-                        stem = processor['stemmer'].stem(word)
-                        if len(stem) > 2 and stem != word:
-                            filtered_words.append(stem)
-                            filtered_positions.append(pos)
-                    except:
-                        pass
-                
-                # Add lemmatized version
-                if processor.get('lemmatizer'):
-                    try:
-                        lemma = processor['lemmatizer'].parse(word)[0].normal_form
-                        if lemma != word and lemma not in filtered_words:
-                            filtered_words.append(lemma)
-                            filtered_positions.append(pos)
-                    except:
-                        pass
+
+                # Language-specific normalization
+                if language == 'ru':
+                    # Russian: prefer lemmatization only
+                    if processor.get('lemmatizer'):
+                        try:
+                            lemma = processor['lemmatizer'].parse(word)[0].normal_form
+                            if len(lemma) > 2 and lemma != word and lemma not in filtered_words:
+                                filtered_words.append(lemma)
+                                filtered_positions.append(pos)
+                        except:
+                            pass
+                elif language == 'en':
+                    # English: prefer stemming only
+                    if processor.get('stemmer'):
+                        try:
+                            stem = processor['stemmer'].stem(word)
+                            if len(stem) > 2 and stem != word and stem not in filtered_words:
+                                filtered_words.append(stem)
+                                filtered_positions.append(pos)
+                        except:
+                            pass
+                else:
+                    # Fallback for other languages: try stem first, else lemma
+                    if processor.get('stemmer'):
+                        try:
+                            stem = processor['stemmer'].stem(word)
+                            if len(stem) > 2 and stem != word and stem not in filtered_words:
+                                filtered_words.append(stem)
+                                filtered_positions.append(pos)
+                        except:
+                            pass
+                    elif processor.get('lemmatizer'):
+                        try:
+                            lemma = processor['lemmatizer'].parse(word)[0].normal_form
+                            if len(lemma) > 2 and lemma != word and lemma not in filtered_words:
+                                filtered_words.append(lemma)
+                                filtered_positions.append(pos)
+                        except:
+                            pass
         
         return filtered_words, filtered_positions
     
@@ -280,7 +405,7 @@ class SmartSearchEngine:
             self.conn.execute('''
                 INSERT INTO idf_scores (term, idf, df)
                 VALUES (?, ?, ?)
-            ''', (term, max(idf, 0.01), df))
+            ''', (term, idf, df))
         
         self.conn.commit()
     
@@ -315,9 +440,11 @@ class SmartSearchEngine:
         if not candidate_docs:
             return []
         
-        # Get average document length
-        cursor = self.conn.execute('SELECT AVG(LENGTH(processed_terms)) FROM documents')
-        avg_doc_length = cursor.fetchone()[0] or 1
+        # Get average document length (mean token count)
+        cursor = self.conn.execute('SELECT processed_terms FROM documents')
+        rows = cursor.fetchall()
+        lengths = [len(json.loads(r[0])) for r in rows]
+        avg_doc_length = (sum(lengths) / len(lengths)) if lengths else 1
         
         # Calculate BM25 scores
         results = []
@@ -398,8 +525,10 @@ class SmartSearchEngine:
         doc_terms = json.loads(cursor.fetchone()[0])
         doc_length = len(doc_terms)
         
-        cursor = self.conn.execute('SELECT AVG(LENGTH(processed_terms)) FROM documents')
-        avg_doc_length = cursor.fetchone()[0] or 1
+        cursor = self.conn.execute('SELECT processed_terms FROM documents')
+        rows = cursor.fetchall()
+        lengths = [len(json.loads(r[0])) for r in rows]
+        avg_doc_length = (sum(lengths) / len(lengths)) if lengths else 1
         
         for term in query_terms:
             cursor = self.conn.execute(
